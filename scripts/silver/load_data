@@ -1,0 +1,213 @@
+CREATE OR ALTER PROCEDURE silver.silver_data_load AS
+BEGIN
+BEGIN TRY
+		--=======================================================================================
+		--          Product Information Table: silver.crm_prd_info
+		--=======================================================================================
+
+
+		-- DATA LOADING SCRIPT
+		TRUNCATE TABLE silver.crm_prd_info;
+		INSERT INTO silver.crm_prd_info (
+			prd_id,
+			cat_id,
+			prd_key,
+			prd_nm,
+			prd_cost,
+			prd_line,
+			prd_start_date,
+			prd_end_date
+		)
+		SELECT
+			prd_id,
+			Replace(substring(prd_key, 1, 5), '-', '_') as cat_id,
+			substring(prd_key, 7, LEN(prd_key)) as prd_key,
+			prd_nm,
+	
+			ISNULL(prd_cost, 0) as prd_cost, -- ISNULL replaces where there's NULL with zero
+	
+			CASE UPPER(TRIM(prd_line))
+				WHEN 'M' THEN 'Mountain'
+				WHEN 'R' THEN 'Road'
+				WHEN 'S' THEN 'Other Sales'
+				WHEN 'T' THEN 'Touring'
+				ELSE 'n/a'
+			END as prd_line,
+			CAST (prd_start_dt AS DATE) as prd_start_date,
+			CAST(LEAD(prd_start_dt) OVER(PARTITION BY prd_key ORDER BY prd_start_dt) -1 as DATE) As prd_end_date  
+			-- Note of position of -1
+			-- It is okay to have missing end dates.
+		FROM bronze.crm_prd_info	
+
+
+		--=======================================================================================
+		--          crm_cust_info
+		--=======================================================================================
+		-- Truncate and then load data into the silver layer
+		TRUNCATE TABLE silver.crm_cust_info;
+
+		INSERT INTO silver.crm_cust_info
+			 (cst_id,
+			cst_key,
+			cst_firstname,
+			cst_lastname,
+			cst_marital_status,
+			cst_gender,
+			cst_create_date
+			 )
+	 
+			select 
+				cst_id, 
+				cst_key, 
+		-- 2. Remove Trailing spaces in string columns 
+				TRIM(cst_firstname),
+				TRIM(cst_lastname),
+		
+		-- 3. Standardization in the cardinality columns
+				CASE WHEN UPPER(TRIM(cst_material_status)) = 'M' THEN 'Married'
+					WHEN UPPER(TRIM(cst_material_status)) = 'F' THEN 'Single'
+					ELSE 'n/a' 
+				END,
+		
+				CASE WHEN UPPER(TRIM(cst_gndr)) = 'M' THEN 'Male'
+					WHEN UPPER(TRIM(cst_gndr)) = 'F' THEN 'Female'
+					ELSE 'n/a'
+				END,
+				cst_create_date
+			from
+		-- 1. Check for Duplicates and Nulls in the primary Key
+				(
+				SELECT *,
+						ROW_NUMBER () OVER (PARTITION BY cst_id     -- Groups the cst_id 
+						ORDER BY cst_create_date DESC) as flag_last -- Orders the cst_id by the date created 
+				FROM bronze.crm_cust_info
+				WHERE cst_id IS NOT NULL
+				) t where flag_last = 1 -- Picks the latest cst_id as per date created	
+	
+
+		--=========================================
+		--     crm_sales_details
+		--=========================================
+
+		-- silver.crm_sales_details
+		TRUNCATE TABLE silver.crm_sales_details;
+		INSERT INTO silver.crm_sales_details (
+			sales_order_number, 
+			sales_product_key,
+			sales_customer_id,
+			sales_order_date,
+			sales_ship_date,
+			sales_due_date,
+			sales_sales,
+			sales_quantity,
+			sales_price
+
+		)
+		SELECT 
+		sls_ord_num as sales_order_number,
+		sls_prd_key as sales_product_key,
+		sls_cust_id as sales_customer_id, 
+
+		CASE
+			WHEN TRY_CAST(CAST(sls_order_dt AS CHAR(8)) AS DATE) 
+				 BETWEEN '2000-01-01' AND '2050-01-01'
+			THEN TRY_CAST(CAST(sls_order_dt AS CHAR(8)) AS DATE)
+			ELSE NULL
+		END AS sales_order_date,
+
+		CASE
+			WHEN sls_ship_dt = 0 THEN NULL
+			WHEN TRY_CAST(CAST(sls_ship_dt AS CHAR(8)) AS DATE)
+				 BETWEEN '2000-01-01' AND '2050-01-01'
+			THEN TRY_CAST(CAST(sls_ship_dt AS CHAR(8)) AS DATE)
+			ELSE NULL
+		END AS sales_ship_date,
+
+
+		CASE 
+			WHEN sls_due_dt = 0 THEN NULL
+			ELSE TRY_CAST(CAST(sls_due_dt AS CHAR(8)) AS DATE)
+		END AS sales_due_date,
+		-- sales
+		CASE 
+			WHEN sls_sales IS NULL 
+				 OR sls_sales < 0 
+				 OR sls_price IS NULL
+				 OR sls_quantity IS NULL
+				 OR sls_sales != ABS(sls_quantity) * ABS(sls_price)
+			THEN ABS(sls_quantity) * ABS(sls_price)
+			ELSE sls_sales
+		END AS sales_sales,
+		ABS(sls_quantity) AS sales_quantity,
+		ABS(sls_price) AS sales_price
+		FROM bronze.crm_sales_details
+
+
+		--=========================================
+		-- INSERTING INTO silver.erp_cust table
+		--=========================================
+
+		TRUNCATE TABLE silver.erp_cust;
+		INSERT INTO silver.erp_cust (
+		cid,
+		cust_bdate,
+		cust_gen
+		)
+
+		select 
+		CASE WHEN cid like 'NAS%' THEN SUBSTRING(cid, 4, LEN(cid))
+			ELSE cid
+		END AS cid, 
+
+		CASE WHEN cust_bdate > GETDATE () then NULL
+			ELSE cust_bdate
+		END AS cust_bdate, 
+		CASE WHEN TRIM(cust_gen) IN ('M', 'Male') THEN 'Male'
+			WHEN TRIM(cust_gen) IN ('F', 'Female') THEN 'Female'
+			ELSE 'n/a'
+		END AS cust_gender
+
+		FROM bronze.erp_cust
+
+
+		-- ========================================
+		-- Customer Location Table
+		--=========================================
+		TRUNCATE TABLE silver.erp_loc;
+		INSERT INTO silver.erp_loc (
+			loc_cid,
+			loc_country
+		)
+		select REPLACE(loc_cid, '-', '') as loc_id,
+		CASE WHEN TRIM(loc_cntry) = 'DE' THEN 'Germany'
+			 WHEN TRIM(loc_cntry) IN ('USA', 'US') THEN 'United States'
+			 WHEN TRIM(loc_cntry) = '' OR TRIM(loc_cntry) IS NULL THEN 'n/a'
+			 ELSE TRIM(loc_cntry)
+		END AS loc_country
+		from bronze.erp_loc
+
+
+		-- ========================================
+		-- Customer Product Category Table
+		--=========================================
+		TRUNCATE TABLE silver.erp_px_cat;
+		INSERT INTO silver.erp_px_cat (
+			pr_cat_id,
+			px_cat_cat, 
+			px_cat_subcat,
+			px_cat_maintenance
+		)
+		select pr_cat_id, 
+			px_cat_cat, 
+			px_cat_subcat,
+			TRIM(px_cat_maintenance)
+		from bronze.erp_px_cat
+END TRY
+
+BEGIN CATCH
+
+END CATCH 
+END
+
+
+EXEC silver.silver_data_load
