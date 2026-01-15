@@ -1,34 +1,251 @@
--- Product Information Table: silver.crm_prd_info
 
--- DATA LOADING SCRIPT
-TRUNCATE TABLE silver.crm_prd_info;
-INSERT INTO silver.crm_prd_info (
-	prd_id,
-	cat_id,
-	prd_key,
-	prd_nm,
-	prd_cost,
-	prd_line,
-	prd_start_date,
-	prd_end_date
-)
-SELECT
-	prd_id,
-	Replace(substring(prd_key, 1, 5), '-', '_') as cat_id,
-	substring(prd_key, 7, LEN(prd_key)) as prd_key,
-	prd_nm,
+-- scripts
+
+-- ================================================
+-- Product Information Table: silver.crm_prd_info
+--=================================================
+-- DATA QUALITY CHECKS 
+select * from bronze.crm_prd_info
+
+-- 1. Data Quality check in the primary key (Deduplication)
+select prd_id,
+	count(*) all_products
+from bronze.crm_prd_info
+group by prd_id
+Having count(*) >1
+
+--
+-- 2. Deriving new columns
+--
+-- split the prd_key to generate a new column called cat_id, 
+--this the product category in the product category table
+select 
+	count (Replace(substring(prd_key, 1, 5), '-', '_'))  as counts
+from silver.crm_prd_info
+
+-- Check for categories in the product information table that are missing in the product category table.
+select 
+	Replace(substring(prd_key, 1, 5), '-', '_') as cat_id
+from bronze.crm_prd_info
+WHERE Replace(substring(prd_key, 1, 5), '-', '_')  NOT IN 
+(SELECT DISTINCT pr_cat_id from bronze.erp_px_cat)
+-- There is one category ' CO_PE' missing in the product from the the product category table. 
+-- This will be handled when cleaning and transforming the px_cat table
+
+-- 3. Deriving new columns - SUBSTRING & LEN
+--
+select 
+	substring(prd_key, 7, LEN(prd_key)) as sls_prd_key
+from bronze.crm_prd_info
+
+--
+-- 4. Check for Trailing Spaces
+--
+select * 
+from silver.crm_prd_info
+where prd_nm != TRIM(prd_nm)
+
+--
+-- 5. Check for NULLS or negative numbers in the prd_cost
+--
+select * 
+from silver.crm_prd_info
+where prd_cost <0 OR prd_cost IS NULL
+
+--
+-- 6. Data Standardization and Normalization
+--
+select DISTINCT prd_line 
+from silver.crm_prd_info
+-- use friendly full names 
+-- CASE WHEN 
+
+--
+-- 7. DATA Type Casting
+--
+-- Check for invalid date orders
+-- start date should be < end date
+select prd_key, 
+		prd_start_date,
+		prd_end_date
+from silver.crm_prd_info
+where prd_key IN ( 'AC-HE-HL-U509-R', 'AC-HE-HL-U509')
+--Use LEAD function to have the next start date as the end date -1. 
+
+select * from silver.crm_prd_info
+select count(*) from silver.crm_prd_info
+
+-- ================================================
+--          Customer Information Table
+--=================================================
+-- Explore the customer information table brom the bronze laye
+select * from bronze.crm_cust_info
+-- 1. Check for Duplicates and Nulls in the primary Key
+		(
+		SELECT *,
+				ROW_NUMBER () OVER (PARTITION BY cst_id     -- Groups the cst_id 
+				ORDER BY cst_create_date DESC) as flag_last -- Orders the cst_id by the date created 
+		FROM bronze.crm_cust_info
+		WHERE cst_id IS NOT NULL
+		) t where flag_last = 1 -- Picks the latest cst_id as per date created	
+
+-- 2. Remove Trailing spaces in string columns 
+		
+		
+-- 3. Standardization in the cardinality columns
+		
+				
+-- Confirm data entered in the silver layer vs bronze layer		
+select count(*) from bronze.crm_cust_info	
+select count(*) from silver.crm_cust_info
+
+-- Bronze rows with NULL cst_id (not loaded into Silver)
+select b.* 
+from bronze.crm_cust_info b
+LEFT JOIN silver.crm_cust_info s
+	ON b.cst_id = s.cst_id
+WHERE s.cst_id IS NULL
+
+-- Duplicate Bronze customer IDs that need deduplication before Silver load
+select cst_id,
+	count (*) all_records
+from bronze.crm_cust_info
+WHERE cst_id IS NOT NULL
+GROUP BY cst_id
+HAVING count(*) >1
+-- columns in the silver layer
+select * from silver.crm_cust_info
+
+-- ===========================================================================================================
+--              sales_details table.
+--============================================================================================================
+
+select sales_order_number 
+from silver.crm_sales_details 
+where sales_order_number <> TRIM (sales_order_number)
+
+-----------------------------------------------------
+-- check for missing product keys or customer id's in product information and customer information tables
+select sales_customer_id from silver.crm_sales_details
+where sales_customer_id NOT IN (SELECT cst_id from silver.crm_cust_info)
+------------------------------------------------------
+-- Check for Negative dates
+SELECT 
+    sales_order_date,
+    COUNT(*) AS order_counts
+FROM silver.crm_sales_details
+WHERE sales_order_date IS NULL
+GROUP BY sales_order_date;
+
+
+-- convert dates with zero into nulls
+SELECT 
+    sales_order_date,
+    COUNT(*) AS order_counts
+FROM silver.crm_sales_details
+WHERE sales_order_date IS NULL
+   OR sales_order_date < '1900-01-01'
+   OR sales_order_date > '2050-01-01'
+GROUP BY sales_order_date;
+
+-- Validation for ship date
+SELECT 
+    sales_ship_date,
+    COUNT(*) AS record_count
+FROM silver.crm_sales_details
+WHERE sales_ship_date IS NULL
+   OR sales_ship_date < '2000-01-01'
+   OR sales_ship_date > '2050-01-01'
+GROUP BY sales_ship_date
+ORDER BY sales_ship_date;
+
+
+-- Validation for ship dates < > order dates and delayed shipments
+SELECT 
+    sales_order_date,
+    sales_ship_date,
+    DATEDIFF(DAY, sales_order_date, sales_ship_date) AS days_to_ship,
+    COUNT(*) AS record_count
+FROM silver.crm_sales_details
+WHERE sales_ship_date IS NOT NULL
+  AND sales_order_date IS NOT NULL
+  AND DATEDIFF(DAY, sales_order_date, sales_ship_date) > 180
+GROUP BY 
+    sales_order_date,
+    sales_ship_date;
+
+-- Engage stakeholders for possibe solutions
+-- If sales is negative, zero or null, derive it using quantity * price
+-- If price is zero or null, calculate using sales and quantity
+-- If price is negative, convert to +ve or use absolute value
+
+-- Business rules columns
+SELECT DISTINCT sales_sales, sales_quantity, sales_price
+FROM silver.crm_sales_details
+WHERE sales_sales IS NULL
+   OR sales_quantity IS NULL
+   OR sales_price IS NULL
+   OR sales_sales < 0
+   OR sales_quantity < 0
+   OR sales_price < 0
+   OR sales_sales != sales_quantity * sales_price
+ORDER BY sales_sales, sales_quantity, sales_price;
+-- Final data loaded
+SELECT * FROM silver.crm_sales_details
+
+-- ================================================
+-- Customers Table - erp_cust
+--=================================================
+-- Remove the firts 3 characters NAS from the cid column to get the right customer key. 
+select cid from silver.erp_cust
+where cid like 'NAS%'
+
+-- Check for birth dates greater than today. 
+select cust_bdate, count(*) as bad_dates
+from silver.erp_cust
+where cust_bdate > GETDATE()
+group by cust_bdate
+
+-- Cardinality columns
+select distinct cust_gen from silver.erp_cust
+
+-- Confirm table
+select * from silver.erp_cust
+
+-- ================================================
+-- Customer Location Table
+--=================================================
+
+select * from bronze.erp_loc
+-- Replace '-' in loc_cid with ''
+select loc_cid from silver.erp_loc 
+where loc_cid like '_-%'
+
+-- Standardize the low cardinality column loc_cntry
+SELECT DISTINCT loc_country from silver.erp_loc
+-- confirm 
+select * from silver.erp_loc
+
+--==================================================
+-- product category table
+--==================================================
+-- Unwated spaces in 
+
+select pr_cat_id 
+from silver.erp_px_cat
+where TRIM(pr_cat_id) != pr_cat_id  
+
+select px_cat_cat
+from silver.erp_px_cat
+where TRIM(px_cat_cat) != px_cat_cat  
+
+select px_cat_subcat 
+from silver.erp_px_cat
+where TRIM(px_cat_subcat) != px_cat_subcat  
+
+-- Cardinal Columns standardization
+select distinct px_cat_maintenance
+from silver.erp_px_cat
+
+select * from silver.erp_px_cat
 	
-	ISNULL(prd_cost, 0) as prd_cost, -- ISNULL replaces where there's NULL with zero
-	
-	CASE UPPER(TRIM(prd_line))
-		WHEN 'M' THEN 'Mountain'
-		WHEN 'R' THEN 'Road'
-		WHEN 'S' THEN 'Other Sales'
-		WHEN 'T' THEN 'Touring'
-		ELSE 'n/a'
-	END as prd_line,
-	CAST (prd_start_dt AS DATE) as prd_start_date,
-	CAST(LEAD(prd_start_dt) OVER(PARTITION BY prd_key ORDER BY prd_start_dt) -1 as DATE) As prd_end_date  
-	-- Note of position of -1
-	-- It is okay to have missing end dates.
-FROM bronze.crm_prd_info	
